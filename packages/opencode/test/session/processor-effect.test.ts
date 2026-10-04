@@ -3,7 +3,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
-import { tool } from "ai"
+import { LoadAPIKeyError, tool } from "ai"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import path from "path"
 import z from "zod"
@@ -12,6 +12,7 @@ import { Provider } from "@/provider/provider"
 
 import { Session } from "@/session/session"
 import { LLM } from "../../src/session/llm"
+import { AuthError } from "../../src/session/message-error"
 import { MessageV2 } from "../../src/session/message-v2"
 import { SessionProcessor } from "../../src/session/processor"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
@@ -225,6 +226,26 @@ const fragmentFailureLLM = Layer.succeed(
 )
 const fragmentFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, fragmentFailureLLM]])
 const itFragmentFailure = testEffect(fragmentFailureEnv)
+
+// Fork (task 2.3, upstream anomalyco/opencode#53106): the stub rejects the
+// first turn with an auth failure (expired credentials) and serves later
+// turns normally, modeling re-authentication without leaving the session.
+let authRecoveryAuthed = false
+const authRecoveryLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      authRecoveryAuthed
+        ? Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          )
+        : Stream.fail(new LoadAPIKeyError({ message: "No API key provided" })),
+  }),
+)
+const authRecoveryEnv = LayerNode.compile(root, [...replacements, [LLM.node, authRecoveryLLM]])
+const itAuthRecovery = testEffect(authRecoveryEnv)
 
 const boot = Effect.fn("test.boot")(function* () {
   const processors = yield* SessionProcessor.Service
@@ -1165,6 +1186,79 @@ itFragmentFailure.live("session.processor effect tests retain partial legacy par
         expect(seen).toContain(MessageV2.Event.PartUpdated.type)
         expect(seen).toContain(Session.Event.Error.type)
         expect(seen.filter((type) => type.startsWith("session.next."))).toEqual([])
+      }),
+    { config: cfg },
+  ),
+)
+
+itAuthRecovery.live("session.processor effect tests recover the same session after re-authentication", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        authRecoveryAuthed = false
+        const { processors, session, provider } = yield* boot()
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "auth failure, then re-auth")
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const input = {
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [] as string[],
+          messages: [{ role: "user" as const, content: "auth failure, then re-auth" }],
+          tools: {},
+        }
+
+        // Turn 1: credentials are expired. The turn stops with an auth error
+        // instead of retrying or compacting, and the session stays open.
+        const first = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const failing = yield* processors.create({ assistantMessage: first, sessionID: chat.id, model: mdl })
+        expect(
+          yield* failing.process({
+            ...input,
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+          }),
+        ).toBe("stop")
+        expect(AuthError.isInstance(failing.message.error)).toBe(true)
+
+        // Prior context is intact after the auth failure.
+        const before = yield* MessageV2.parts(parent.id)
+        expect(before).toEqual(
+          expect.arrayContaining([expect.objectContaining({ type: "text", text: "auth failure, then re-auth" })]),
+        )
+
+        // Re-authenticate in place and continue the SAME session.
+        authRecoveryAuthed = true
+        const second = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const recovered = yield* processors.create({ assistantMessage: second, sessionID: chat.id, model: mdl })
+        expect(
+          yield* recovered.process({
+            ...input,
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+          }),
+        ).toBe("continue")
+        expect(recovered.message.error).toBeUndefined()
+
+        // The original context survived the failure and the recovery.
+        const after = yield* MessageV2.parts(parent.id)
+        expect(after).toEqual(
+          expect.arrayContaining([expect.objectContaining({ type: "text", text: "auth failure, then re-auth" })]),
+        )
       }),
     { config: cfg },
   ),
