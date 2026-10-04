@@ -153,7 +153,10 @@ export function sanitizeOrphanedToolParts(messages: readonly ModelMessage[]): Mo
       (part) => part.type !== "tool-result" || calls.has(part.toolCallId),
     )
     if (kept.length === 0 && message.content.length > 0) continue
-    sanitized.push(kept.length === message.content.length ? message : { ...message, content: kept })
+    // Only array items were removed, so the content still matches the
+    // original variant. The spread breaks TS's variant correlation, hence
+    // the cast.
+    sanitized.push(kept.length === message.content.length ? message : ({ ...message, content: kept } as ModelMessage))
   }
   return sanitized
 }
