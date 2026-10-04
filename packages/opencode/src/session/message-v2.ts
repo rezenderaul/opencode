@@ -128,6 +128,36 @@ function providerMeta(metadata: Record<string, any> | undefined) {
   return Object.keys(rest).length > 0 ? rest : undefined
 }
 
+// Fork (upstream anomalyco/opencode#53109): the retained context tail can
+// start in the middle of a tool-call group, so the lowered outgoing window
+// may carry a tool-result whose tool-call was cut off. Strict
+// OpenAI-compatible gateways reject that sequence with HTTP 400
+// (invalid_request_error) on every turn until the orphan leaves the window.
+// This guard drops such orphaned results from the outgoing request only.
+// Stored history is never modified: messages are rebuilt, never mutated.
+export function sanitizeOrphanedToolParts(messages: readonly ModelMessage[]): ModelMessage[] {
+  const calls = new Set<string>()
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) continue
+    for (const part of message.content) {
+      if (part.type === "tool-call") calls.add(part.toolCallId)
+    }
+  }
+  const sanitized: ModelMessage[] = []
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) {
+      sanitized.push(message)
+      continue
+    }
+    const kept = message.content.filter(
+      (part) => part.type !== "tool-result" || calls.has(part.toolCallId),
+    )
+    if (kept.length === 0 && message.content.length > 0) continue
+    sanitized.push(kept.length === message.content.length ? message : { ...message, content: kept })
+  }
+  return sanitized
+}
+
 export const toModelMessagesEffect = Effect.fnUntraced(function* (
   input: WithParts[],
   model: Provider.Model,
@@ -407,15 +437,17 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
 
   const tools = Object.fromEntries(Array.from(toolNames).map((toolName) => [toolName, { toModelOutput }]))
 
-  return yield* Effect.promise(() =>
-    convertToModelMessages(
+  return yield* Effect.promise(async () => {
+    const converted = await convertToModelMessages(
       result.filter((msg) => msg.parts.some((part) => part.type !== "step-start")),
       {
         //@ts-expect-error (convertToModelMessages expects a ToolSet but only actually needs tools[name]?.toModelOutput)
         tools,
       },
-    ),
-  )
+    )
+    // Fork: sanitize the outgoing window only; stored history is untouched.
+    return sanitizeOrphanedToolParts(converted)
+  })
 })
 
 export function toModelMessages(
