@@ -758,7 +758,7 @@ const layer = Layer.effect(
           Effect.logError(`failed to ${label}`, {
             clientName,
             ...meta,
-            error: error instanceof Error ? error.message : String(error),
+            ...McpCatalog.errorMeta(error),
           }),
         ),
         Effect.orElseSucceed(() => undefined),

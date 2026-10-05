@@ -82,6 +82,20 @@ export function convertTool(mcpTool: MCPToolDef, client: Client, timeout?: numbe
   })
 }
 
+// Fork (upstream anomalyco/opencode#53051): MCP error text is untrusted
+// diagnostic data — a server can echo configured secrets (e.g. env values)
+// in JSON-RPC errors. Only safe metadata (error name, protocol code) may
+// reach the local engine log; the free-text message never may.
+export function errorMeta(error: unknown): Record<string, string | number> {
+  if (error instanceof Error) {
+    const meta: Record<string, string | number> = { errorName: error.name }
+    const code = (error as { code?: unknown }).code
+    if (typeof code === "number" || typeof code === "string") meta.errorCode = code
+    return meta
+  }
+  return { errorName: "UnknownError" }
+}
+
 export function fetch<T extends { name: string }>(
   clientName: string,
   client: Client,
@@ -96,7 +110,7 @@ export function fetch<T extends { name: string }>(
     Effect.tapError((error) =>
       Effect.logWarning(`failed to get ${label}`, {
         clientName,
-        error: error instanceof Error ? error.message : String(error),
+        ...errorMeta(error),
       }),
     ),
     Effect.map((items) => {
